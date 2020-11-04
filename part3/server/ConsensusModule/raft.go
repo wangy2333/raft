@@ -1,8 +1,12 @@
 package ConsensusModule
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
+	"log"
 	"math/rand"
+	"raft/part3/server/storage"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -63,7 +67,7 @@ type ConsensusModule struct {
 	newCommitReadyChan chan struct{}
 	//在新建ConsensusModule时会接收一个commit channel作为参数——CM可以使用该通道向调用方发送已提交的指令
 	//commitChan chan<- CommitEntry。
-	commitChan chan<- CommitEntry
+	commitChan chan CommitEntry
 	//最后一个commit的index
 	commitIndex int
 	//最后一个applied的index
@@ -83,9 +87,11 @@ type ConsensusModule struct {
 	server *server
 	//选举重置时间
 	electionResetEvent time.Time
+	//存储模块
+	storage storage.Storage
 }
 
-func NewConsensusModule(serverId int, peerIds []int, ready <-chan struct{}, srv *server) *ConsensusModule {
+func NewConsensusModule(serverId int, peerIds []int, storage storage.Storage, ready <-chan struct{}, srv *server) *ConsensusModule {
 	cm := &ConsensusModule{}
 	cm.Id = serverId
 	cm.voteFor = -1 //初始-1代表没有投票过
@@ -93,6 +99,7 @@ func NewConsensusModule(serverId int, peerIds []int, ready <-chan struct{}, srv 
 	cm.state = Follower
 	cm.peerIds = peerIds
 	cm.server = srv
+	cm.storage = storage
 	cm.commitIndex = -1
 	cm.lastApplied = -1
 	cm.commitChan = make(chan CommitEntry, 16)
@@ -100,6 +107,9 @@ func NewConsensusModule(serverId int, peerIds []int, ready <-chan struct{}, srv 
 	cm.newCommitReadyChan = make(chan struct{})
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
+	if cm.storage.HasDate() {
+		cm.restoreFromStorage(cm.storage)
+	}
 	go func() {
 		//fmt.Println("等待信号")
 		<-ready
@@ -109,6 +119,9 @@ func NewConsensusModule(serverId int, peerIds []int, ready <-chan struct{}, srv 
 		cm.runElectionTimer()
 	}()
 	go cm.commitChanSender()
+	go cm.commitCommandPersistent()
+	//我认为应该在这个地方起一个goroutine 然后接受commitChan的提交的log 然后将其写入map或者是文件当中
+	//fmt.Println("启动服务的时候，信息", cm.voteFor, cm.currentTerm, cm.log)
 	return cm
 }
 func (cm *ConsensusModule) Submit(command interface{}) (bool, int) {
@@ -119,6 +132,7 @@ func (cm *ConsensusModule) Submit(command interface{}) (bool, int) {
 	if cm.state == Leader {
 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
 		//cm.consoleLog("... log=%v", cm.log)
+		cm.persistToStorage()
 		return true, cm.Id
 	}
 	return false, -1
@@ -147,7 +161,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 			return
 		}
 		if saveTerm != cm.currentTerm {
-			fmt.Println("当前节点的任期和选举前任期不符合,停止自旋")
+			//fmt.Println("当前节点的任期和选举前任期不符合,停止自旋")
 			cm.mut.Unlock()
 			return
 		}
@@ -209,7 +223,8 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		reply.VoteGranted = false
 	}
 	reply.Term = cm.currentTerm
-	cm.consoleLog("投票结束，返回内容：%v", reply)
+	cm.persistToStorage()
+	//cm.consoleLog("投票结束，返回内容：%v", reply)
 	return nil
 }
 
@@ -377,12 +392,12 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 							}
 						}
 						if cm.commitIndex != saveCommitIndex {
-							cm.consoleLog("当前leader更新本地log")
-							//cm.log = append(cm.log,)
+							//cm.consoleLog("当前leader持久化log")
 							//发送一个消息 告诉可以 更新呢log了
 							cm.newCommitReadyChan <- struct{}{}
 						}
-					} else {
+					} else { //这里就保证了 主节点的那些从节点 如果大于主节点的日志是没有意义的， 最多就是同log索引同任期的最后一个index有意义，其他都会被覆盖掉
+						//而这里减1 就是说明可能当前不够需要往前就开始覆盖
 						cm.nextIndex[peerId] = ni - 1
 						cm.consoleLog("AppendEntries reply from %d no success: nextIndex := %d", peerId, ni-1)
 					}
@@ -429,12 +444,13 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			}
 			if args.LeaderCommit > cm.commitIndex {
 				cm.commitIndex = cm.intMin(args.LeaderCommit, len(cm.log)-1)
-				//cm.consoleLog("... setting commitIndex=%d", cm.commitIndex)
+				cm.consoleLog("从节点发现主的提交大于自己 ，就会持久化")
 				cm.newCommitReadyChan <- struct{}{}
 			}
 		}
 	}
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	//cm.consoleLog("节点[%d],接受到节点[%d]的心跳包,当前心跳任期[%d],节点返回任期[%d]", cm.Id, args.LeaderId, args.Term, cm.currentTerm)
 	return nil
 }
@@ -464,11 +480,13 @@ func (cm *ConsensusModule) commitChanSender() {
 		saveTerm := cm.currentTerm
 		saveLastApplied := cm.lastApplied
 		var entries []LogEntry
+		//commit是我需要提交到log的index 而lastApplied则是之前提交的长度，由此找到从上次到这次准备提交的区间
 		if cm.commitIndex > cm.lastApplied {
 			entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]
 			cm.lastApplied = cm.commitIndex
 		}
 		cm.mut.Unlock()
+		//最后逐步将log中的command都输入到commitChan当中
 		for i, entriy := range entries {
 			cm.commitChan <- CommitEntry{
 				Command: entriy.Command,
@@ -478,4 +496,59 @@ func (cm *ConsensusModule) commitChanSender() {
 		}
 	}
 	cm.consoleLog("commitChanSender done ")
+}
+func (cm *ConsensusModule) commitCommandPersistent() {
+	for command := range cm.commitChan {
+		fmt.Println("写入文件", command)
+	}
+}
+
+//将存储起来的值重新给cm的几个主要的参数，主要是voteFor term log
+func (cm *ConsensusModule) restoreFromStorage(s storage.Storage) {
+	if voteFor, found := s.Get("voteForDate"); found {
+		decoder := gob.NewDecoder(bytes.NewBuffer(voteFor))
+		if err := decoder.Decode(cm.voteFor); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("currentTerm not found in storage")
+	}
+	if currentTerm, found := s.Get("TermDate"); found {
+		decoder := gob.NewDecoder(bytes.NewBuffer(currentTerm))
+		if err := decoder.Decode(cm.currentTerm); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("currentTerm not found in storage ")
+	}
+	if Log, found := s.Get("logDate"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(Log))
+		if err := d.Decode(cm.log); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("log not found in storage")
+	}
+}
+
+func (cm *ConsensusModule) persistToStorage() {
+	var voteForDate bytes.Buffer
+	if err := gob.NewEncoder(&voteForDate).Encode(cm.voteFor); err != nil {
+		log.Fatal(err)
+	} else {
+		cm.storage.Set("voteForDate", voteForDate.Bytes())
+	}
+
+	var TermDate bytes.Buffer
+	if err := gob.NewEncoder(&TermDate).Encode(cm.currentTerm); err != nil {
+		log.Fatal(err)
+	} else {
+		cm.storage.Set("TermDate", TermDate.Bytes())
+	}
+	var logDate bytes.Buffer
+	if err := gob.NewEncoder(&logDate).Encode(cm.log); err != nil {
+		log.Fatal(err)
+	} else {
+		cm.storage.Set("logDate", logDate.Bytes())
+	}
 }

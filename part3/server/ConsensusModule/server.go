@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/rpc"
 	"os"
+	"raft/part3/server/storage"
 	"sync"
 	"time"
 )
@@ -36,10 +37,13 @@ type server struct {
 	cm        *ConsensusModule
 	rpcProxy  *RPCProxy
 	rpcServer *rpc.Server
+	storage   *storage.MapStorage
 }
 
 func NewServer() *server {
-	return &server{}
+	return &server{
+		storage: storage.NewMapStorage(),
+	}
 }
 func (s *server) sayHello(addr string, conn net.Conn) {
 	if _, err2 := conn.Write([]byte(addr + "is ok")); err2 != nil {
@@ -55,7 +59,7 @@ func (s *server) Serve(serverId int) {
 	}
 	s.mut.Lock()
 	//关于一致性模块的创建和rpc的注册
-	s.cm = NewConsensusModule(serverId, peerIds, ready, s)
+	s.cm = NewConsensusModule(serverId, peerIds, s.storage, ready, s)
 	s.rpcProxy = &RPCProxy{cm: s.cm}
 	s.rpcServer = rpc.NewServer()
 	if e := s.rpcServer.RegisterName("ConsensusModule", s.rpcProxy); e != nil {

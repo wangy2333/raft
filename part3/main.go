@@ -1,7 +1,7 @@
 package main
 
 import (
-	"raft/part2/client"
+	"raft/part3/client"
 	"strconv"
 	"time"
 )

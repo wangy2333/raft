@@ -158,7 +158,6 @@ func (c *Client) operation() {
 //设计思路 set传入一个opt 然后丢给operation
 //operation一直监听着管道的消息 如果换了主
 func (c *Client) Set(opt interface{}) {
-	fmt.Println("sss")
 	if opt == nil {
 		return
 	} else {
