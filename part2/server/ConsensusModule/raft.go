@@ -95,7 +95,7 @@ func NewConsensusModule(serverId int, peerIds []int, ready <-chan struct{}, srv 
 	cm.server = srv
 	cm.commitIndex = -1
 	cm.lastApplied = -1
-	cm.commitChan = make(chan CommitEntry, 16)
+	cm.commitChan = make(chan CommitEntry, 100) //注意 缓冲区其实没有这么大，但是做实验的时候，part2还没有消费持久化的地方，当缓冲区满了会阻塞
 	//newCommitReadyChan是负责通知的所以无缓冲
 	cm.newCommitReadyChan = make(chan struct{})
 	cm.nextIndex = make(map[int]int)

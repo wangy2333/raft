@@ -93,14 +93,14 @@ loop:
 		go func(addr string) {
 			defer wg.Done()
 			if conn, err := rpc.Dial("tcp", ServerIP+addr); err != nil {
-				fmt.Printf("[%s] client.linkCluster.rpc is failed:%s \n", addr, err)
+				//fmt.Printf("[%s] client.linkCluster.rpc is failed:%s \n", addr, err)
 				return
 			} else {
 				var args LinkClientArgs
 				var reply LinkClientReply
 				err := conn.Call("ConsensusModule.LinkServer", args, &reply)
 				if err != nil {
-					fmt.Printf("[%s] clinet.linkCluster.rpc.call is failed:%s \n", addr, err)
+					//fmt.Printf("[%s] clinet.linkCluster.rpc.call is failed:%s \n", addr, err)
 					return
 				}
 				if reply.IsLeader {
@@ -158,7 +158,7 @@ func (c *Client) operation() {
 //设计思路 set传入一个opt 然后丢给operation
 //operation一直监听着管道的消息 如果换了主
 func (c *Client) Set(opt interface{}) {
-	fmt.Println("sss")
+	//fmt.Println("sss")
 	if opt == nil {
 		return
 	} else {
